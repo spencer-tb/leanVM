@@ -25,17 +25,32 @@ def require(condition: bool, message: str) -> None:
 # Field arithmetic ------------------------------------------------------------
 
 
-def _base_mul(left: int, right: int) -> int:
-    product = 0
-    while right:
-        if right & 1:
-            product ^= left
-        right >>= 1
-        left <<= 1
+def _reduce(product: int) -> int:
+    """A carry-less product of two K words, reduced modulo x^64 + x^4 + x^3 + x + 1."""
     low, high = product & (2**64 - 1), product >> 64
     folded = low ^ high ^ (high << 1) ^ (high << 3) ^ (high << 4)
     overflow = folded >> 64
     return ((folded & (2**64 - 1)) ^ overflow ^ (overflow << 1) ^ (overflow << 3) ^ (overflow << 4)) & (2**64 - 1)
+
+
+# Carry-less multiplication by integer multiplication. Spread every bit of both operands into a byte of its own: byte k
+# of the integer product then counts the pairs of set bits i, j with i + j = k. While no count reaches 256 no byte
+# carries into the next, and each count's parity is bit k of the carry-less product. Python does the spreading, the
+# product and the parities in C, which is several times faster than shifting and adding bit by bit.
+_SPREAD = bytes.maketrans(b"01", b"\x00\x01")
+_PARITY_DIGIT = bytes(0x30 | (count & 1) for count in range(256))
+
+
+def _clmul(left: int, right: int, bits: int) -> int:
+    """The carry-less product of two `bits`-bit operands whose counts stay below 256: K words (at most 64 terms), or E
+    elements with their limbs 128 bits apart (at most 3 * 64)."""
+    spread_left = int.from_bytes(format(left, f"0{bits}b").encode().translate(_SPREAD), "big")
+    spread_right = int.from_bytes(format(right, f"0{bits}b").encode().translate(_SPREAD), "big")
+    return int((spread_left * spread_right).to_bytes(2 * bits, "big").translate(_PARITY_DIGIT), 2)
+
+
+def _base_mul(left: int, right: int) -> int:
+    return _reduce(_clmul(left, right, 64))
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,12 +82,16 @@ class K:
         return hash(self.value)
 
     def __add__(self, other: object) -> K:
+        if isinstance(other, K):
+            return _k(self.value ^ other.value)
         rhs = _as_k(other)
         return NotImplemented if rhs is None else K(self.value ^ rhs.value)
 
     __radd__ = __add__
 
     def __mul__(self, other: object) -> K:
+        if isinstance(other, K):
+            return _k(_base_mul(self.value, other.value))
         rhs = _as_k(other)
         return NotImplemented if rhs is None else K(_base_mul(self.value, rhs.value))
 
@@ -140,20 +159,19 @@ class E:
         return hash(int(self))
 
     def __add__(self, other: object) -> E:
-        rhs = self.lift(other)
-        return E(self.c0 + rhs.c0, self.c1 + rhs.c1, self.c2 + rhs.c2)
+        rhs = other if isinstance(other, E) else self.lift(other)
+        return _e(self.c0.value ^ rhs.c0.value, self.c1.value ^ rhs.c1.value, self.c2.value ^ rhs.c2.value)
 
     __radd__ = __add__
 
     def __mul__(self, other: object) -> E:
-        rhs = self.lift(other)
-        # y^3 = y + 1 folds the degree-4 product back into three limbs.
-        p0 = self.c0 * rhs.c0
-        p1 = self.c0 * rhs.c1 + self.c1 * rhs.c0
-        p2 = self.c0 * rhs.c2 + self.c1 * rhs.c1 + self.c2 * rhs.c0
-        p3 = self.c1 * rhs.c2 + self.c2 * rhs.c1
-        p4 = self.c2 * rhs.c2
-        return E(p0 + p3, p1 + p3 + p4, p2 + p4)
+        rhs = other if isinstance(other, E) else self.lift(other)
+        # One carry-less product gives the degree-4 product's five coefficients p0..p4, each the unreduced sum of its
+        # limb products: with the limbs 128 bits apart, every power of y gets a window of its own.
+        p = _clmul(self.c0.value | self.c1.value << 128 | self.c2.value << 256, rhs.c0.value | rhs.c1.value << 128 | rhs.c2.value << 256, 384)
+        p0, p1, p2, p3, p4 = (p >> shift & (2**128 - 1) for shift in range(0, 640, 128))
+        # y^3 = y + 1 folds the degree-4 product back into three limbs, and reduction modulo x is linear, so once per limb.
+        return _e(_reduce(p0 ^ p3), _reduce(p1 ^ p3 ^ p4), _reduce(p2 ^ p4))
 
     __rmul__ = __mul__
 
@@ -178,6 +196,22 @@ class E:
 
     def __repr__(self) -> str:
         return f"E(0x{self.c2.value:016x}{self.c1.value:016x}{self.c0.value:016x})"
+
+
+def _k(value: int) -> K:
+    """A K element from a word the arithmetic produced, so already in range: `K(value)` without its checks."""
+    element = object.__new__(K)
+    object.__setattr__(element, "value", value)
+    return element
+
+
+def _e(c0: int, c1: int, c2: int) -> E:
+    """An E element from three words the arithmetic produced: `E(c0, c1, c2)` without its checks."""
+    element = object.__new__(E)
+    object.__setattr__(element, "c0", _k(c0))
+    object.__setattr__(element, "c1", _k(c1))
+    object.__setattr__(element, "c2", _k(c2))
+    return element
 
 
 ZERO = E(0)
@@ -236,7 +270,8 @@ MultilinearPoint: TypeAlias = "tuple[E, ...]"
 def eq_kernel(point: Sequence[E]) -> list[E]:
     out = [ONE]
     for r in point:
-        out = [v * (ONE + r) for v in out] + [v * r for v in out]
+        high = [v * r for v in out]
+        out = [v + h for v, h in zip(out, high)] + high  # v (1 + r) = v + v r
     return out
 
 
@@ -244,7 +279,7 @@ def multilinear_eval(mle: Sequence[K | E], point: Sequence[E]) -> E:
     require(len(mle) == 2 ** len(point), "multilinear table has the wrong size")
     cur = [E.lift(value) for value in mle]
     for r in point:
-        cur = [cur[2 * i] * (ONE + r) + cur[2 * i + 1] * r for i in range(len(cur) // 2)]
+        cur = [cur[2 * i] + (cur[2 * i] + cur[2 * i + 1]) * r for i in range(len(cur) // 2)]  # a (1 + r) + b r
     return cur[0]
 
 
@@ -348,14 +383,6 @@ class Proof:
 # The bytecode table ----------------------------------------------------------------
 
 
-def _reduce_product(product: int) -> int:
-    """A carry-less product of two K words, reduced modulo x^64 + x^4 + x^3 + x + 1."""
-    low, high = product & (2**64 - 1), product >> 64
-    folded = low ^ high ^ (high << 1) ^ (high << 3) ^ (high << 4)
-    overflow = folded >> 64
-    return ((folded & (2**64 - 1)) ^ overflow ^ (overflow << 1) ^ (overflow << 3) ^ (overflow << 4)) & (2**64 - 1)
-
-
 class BytecodeTable:
     """A program's stacked bytecode multilinear: little-endian 64-bit words, kept packed.
 
@@ -415,7 +442,7 @@ class BytecodeTable:
             for shift, value in enumerate(bits):
                 for limb in range(3):
                     limbs[limb] ^= (value >> (64 * limb) & (2**64 - 1)) << shift
-            total = total + high_weight * E(*(_reduce_product(limb) for limb in limbs))
+            total = total + high_weight * _e(*(_reduce(limb) for limb in limbs))
         return total
 
 
