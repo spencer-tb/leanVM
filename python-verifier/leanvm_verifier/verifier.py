@@ -1186,7 +1186,9 @@ def build_layout(bytecode: BytecodeTable, log_memory: int, table_log_heights: Se
             placements.append(Placement(kappa, offsets[circuit.qflock] + slot, circuit.slot_bits))
         else:
             placements.append(Placement(kappa, offsets[column]))
-    return Layout(log_memory, log_bytecode, bytecode, tuple(push), tuple(pull), tuple(count), tuple(placements), stack_log, tuple(table_log_heights), n_lanes)
+    return Layout(
+        log_memory, log_bytecode, bytecode, tuple(push), tuple(pull), tuple(count), tuple(placements), stack_log, tuple(table_log_heights), n_lanes
+    )
 
 
 # WHIR opening ----------------------------------------------------------------
@@ -1297,7 +1299,9 @@ class GluedClaim:
     weight_at: Callable[[Sequence[E]], E]
 
 
-def verify_whir(transcript: Transcript, log_n: int, n_lanes: int, log_inv_rate: int, target: E, root: Digest, evaluate_basis: Callable[[Sequence[E]], E]) -> None:
+def verify_whir(
+    transcript: Transcript, log_n: int, n_lanes: int, log_inv_rate: int, target: E, root: Digest, evaluate_basis: Callable[[Sequence[E]], E]
+) -> None:
     """Verify the base-field multilevel opening with a one-point terminal check."""
     config = derive_config(log_n, log_inv_rate)
     levels = len(config.folds)
@@ -1729,13 +1733,17 @@ def ring_switch(families: Sequence[tuple[MultilinearPoint, Sequence[E]]], transc
 StackClaim: TypeAlias = "tuple[Callable[[Sequence[E]], E], E]"  # the weight it puts on the stack, and the value it claims for it
 
 
-def verify_stacked_opening(transcript: Transcript, root: Digest, stack_log: int, n_lanes: int, log_inv_rate: int, claims: Sequence[StackClaim]) -> None:
+def verify_stacked_opening(
+    transcript: Transcript, root: Digest, stack_log: int, n_lanes: int, log_inv_rate: int, claims: Sequence[StackClaim]
+) -> None:
     """Discharge every claim on the committed stack in one opening: the same powers of one challenge
     batch the values into the target, and the weights into the basis WHIR evaluates at its terminal point.
     """
     weights, values = zip(*claims, strict=True)
     scales = powers(transcript.sample(), len(claims))
-    verify_whir(transcript, stack_log, n_lanes, log_inv_rate, dot(scales, values), root, lambda point: dot(scales, [weight(point) for weight in weights]))
+    verify_whir(
+        transcript, stack_log, n_lanes, log_inv_rate, dot(scales, values), root, lambda point: dot(scales, [weight(point) for weight in weights])
+    )
 
 
 def fiat_shamir_iv(bytecode: BytecodeTable) -> Digest:
@@ -1793,7 +1801,9 @@ def verify_execution(bytecode: BytecodeTable, public_input: Digest, proof: Proof
         # placement's selector, and the two lead the batch in circuit order, taking the first powers.
         qflock = layout.placements[circuit.qflock]
         ringswitches.append((lambda x, qflock=qflock, weight=weight: qflock.eq_above(x) * weight(x[: qflock.variables]), target))
-    verify_stacked_opening(transcript, root, layout.stack_log, layout.n_lanes, log_inverse_rate, [*ringswitches, *(c.on_stack(layout) for c in claims)])
+    verify_stacked_opening(
+        transcript, root, layout.stack_log, layout.n_lanes, log_inverse_rate, [*ringswitches, *(c.on_stack(layout) for c in claims)]
+    )
     transcript.finish()
 
 
