@@ -24,15 +24,6 @@ def require(condition: bool, message: str) -> None:
 
 # Field arithmetic ------------------------------------------------------------
 
-
-def _reduce(product: int) -> int:
-    """A carry-less product of two K words, reduced modulo x^64 + x^4 + x^3 + x + 1."""
-    low, high = product & (2**64 - 1), product >> 64
-    folded = low ^ high ^ (high << 1) ^ (high << 3) ^ (high << 4)
-    overflow = folded >> 64
-    return ((folded & (2**64 - 1)) ^ overflow ^ (overflow << 1) ^ (overflow << 3) ^ (overflow << 4)) & (2**64 - 1)
-
-
 # Carry-less multiplication by integer multiplication. Spread every bit of both operands into a byte of its own: byte k
 # of the integer product then counts the pairs of set bits i, j with i + j = k. While no count reaches 256 no byte
 # carries into the next, and each count's parity is bit k of the carry-less product. Python does the spreading, the
@@ -42,11 +33,31 @@ _PARITY_DIGIT = bytes(0x30 | (count & 1) for count in range(256))
 
 
 def _clmul(left: int, right: int, bits: int) -> int:
-    """The carry-less product of two `bits`-bit operands whose counts stay below 256: K words (at most 64 terms), or E
-    elements with their limbs 128 bits apart (at most 3 * 64)."""
+    """The carry-less product of two `bits`-bit operands whose counts stay below 256: K words (at most 64 terms), or
+    packed E elements (at most 3 * 64)."""
     spread_left = int.from_bytes(format(left, f"0{bits}b").encode().translate(_SPREAD), "big")
     spread_right = int.from_bytes(format(right, f"0{bits}b").encode().translate(_SPREAD), "big")
     return int((spread_left * spread_right).to_bytes(2 * bits, "big").translate(_PARITY_DIGIT), 2)
+
+
+_WORD = 2**64 - 1
+_LIMBS = _WORD | _WORD << 128 | _WORD << 256  # the low 64 bits of each 128-bit window
+
+
+def _reduce(product: int) -> int:
+    """Reduce every 128-bit window of `product`, each a carry-less product of two K words, modulo x^64 + x^4 + x^3 + x + 1.
+    No shift below crosses into the next window, so one pass reduces all three."""
+    low, high = product & _LIMBS, product >> 64 & _LIMBS
+    folded = low ^ high ^ (high << 1) ^ (high << 3) ^ (high << 4)
+    overflow = folded >> 64 & _LIMBS
+    return (folded ^ overflow ^ (overflow << 1) ^ (overflow << 3) ^ (overflow << 4)) & _LIMBS
+
+
+def _fold(product: int) -> int:
+    """A carry-less product of two packed E elements, its five windows the coefficients of y^0..y^4, as a packed E
+    element: y^3 = y + 1 and y^4 = y^2 + y fold the top two windows into the lower three, which are then reduced."""
+    high = product >> 384
+    return _reduce((product & (2**384 - 1)) ^ high ^ (high << 128))
 
 
 def _base_mul(left: int, right: int) -> int:
@@ -109,18 +120,39 @@ def _as_k(value: object) -> K | None:
     return None
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class E:
-    """K[y]/(y^3 + y + 1): the challenge field, a degree-3 extension of K. Limbs may be given as plain integers, which are lifted."""
+    """K[y]/(y^3 + y + 1): the challenge field, a degree-3 extension of K. Limbs may be given as plain integers, which are lifted.
 
-    c0: K
-    c1: K
-    c2: K
+    An element is held as one integer, `packed`, its limbs 128 bits apart: adding is one XOR, and one carry-less product of
+    two packed elements holds all nine limb products, each power of y in a window of its own."""
+
+    __slots__ = ("packed",)
 
     def __init__(self, c0: K | int = 0, c1: K | int = 0, c2: K | int = 0) -> None:
-        object.__setattr__(self, "c0", c0 if isinstance(c0, K) else K(c0))
-        object.__setattr__(self, "c1", c1 if isinstance(c1, K) else K(c1))
-        object.__setattr__(self, "c2", c2 if isinstance(c2, K) else K(c2))
+        c0, c1, c2 = (limb if isinstance(limb, K) else K(limb) for limb in (c0, c1, c2))
+        object.__setattr__(self, "packed", c0.value | c1.value << 128 | c2.value << 256)
+
+    @classmethod
+    def _of(cls, packed: int) -> E:
+        """An element from a packed value the arithmetic produced: `E(c0, c1, c2)` without its checks."""
+        element = object.__new__(cls)
+        object.__setattr__(element, "packed", packed)
+        return element
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("E elements are immutable")
+
+    @property
+    def c0(self) -> K:
+        return _k(self.packed & _WORD)
+
+    @property
+    def c1(self) -> K:
+        return _k(self.packed >> 128 & _WORD)
+
+    @property
+    def c2(self) -> K:
+        return _k(self.packed >> 256)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> E:
@@ -137,7 +169,7 @@ class E:
             return value
         lifted = _as_k(value)
         if lifted is not None:
-            return E(lifted)
+            return E._of(lifted.value)
         raise TypeError(f"cannot use {type(value).__name__} as a field element")
 
     @staticmethod
@@ -148,30 +180,25 @@ class E:
         return self.c0.value | self.c1.value << 64 | self.c2.value << 128
 
     def __bool__(self) -> bool:
-        return bool(self.c0 or self.c1 or self.c2)
+        return bool(self.packed)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, E):
-            return self.c0 == other.c0 and self.c1 == other.c1 and self.c2 == other.c2
-        return not (self.c1 or self.c2) and self.c0 == other
+            return self.packed == other.packed
+        return not self.packed >> 128 and self.c0 == other
 
     def __hash__(self) -> int:
         return hash(int(self))
 
     def __add__(self, other: object) -> E:
         rhs = other if isinstance(other, E) else self.lift(other)
-        return _e(self.c0.value ^ rhs.c0.value, self.c1.value ^ rhs.c1.value, self.c2.value ^ rhs.c2.value)
+        return E._of(self.packed ^ rhs.packed)
 
     __radd__ = __add__
 
     def __mul__(self, other: object) -> E:
         rhs = other if isinstance(other, E) else self.lift(other)
-        # One carry-less product gives the degree-4 product's five coefficients p0..p4, each the unreduced sum of its
-        # limb products: with the limbs 128 bits apart, every power of y gets a window of its own.
-        p = _clmul(self.c0.value | self.c1.value << 128 | self.c2.value << 256, rhs.c0.value | rhs.c1.value << 128 | rhs.c2.value << 256, 384)
-        p0, p1, p2, p3, p4 = (p >> shift & (2**128 - 1) for shift in range(0, 640, 128))
-        # y^3 = y + 1 folds the degree-4 product back into three limbs, and reduction modulo x is linear, so once per limb.
-        return _e(_reduce(p0 ^ p3), _reduce(p1 ^ p3 ^ p4), _reduce(p2 ^ p4))
+        return E._of(_fold(_clmul(self.packed, rhs.packed, 384)))
 
     __rmul__ = __mul__
 
@@ -202,15 +229,6 @@ def _k(value: int) -> K:
     """A K element from a word the arithmetic produced, so already in range: `K(value)` without its checks."""
     element = object.__new__(K)
     object.__setattr__(element, "value", value)
-    return element
-
-
-def _e(c0: int, c1: int, c2: int) -> E:
-    """An E element from three words the arithmetic produced: `E(c0, c1, c2)` without its checks."""
-    element = object.__new__(E)
-    object.__setattr__(element, "c0", _k(c0))
-    object.__setattr__(element, "c1", _k(c1))
-    object.__setattr__(element, "c2", _k(c2))
     return element
 
 
@@ -300,10 +318,10 @@ def eq_eval(left: Sequence[E], right: Sequence[E]) -> E:
 
 
 def dot(left: Sequence[K | E], right: Sequence[K | E]) -> E:
-    result = ZERO
+    product = 0  # the products' unreduced sum, reduced once: reduction is linear
     for x, y in zip(left, right, strict=True):
-        result += E.lift(x) * y
-    return result
+        product ^= _clmul(E.lift(x).packed, E.lift(y).packed, 384)
+    return E._of(_fold(product))
 
 
 def index_mle(point: MultilinearPoint) -> E:
@@ -414,7 +432,7 @@ class BytecodeTable:
         """The multilinear extension at `point`, its variables least significant first."""
         require(len(self.words) == 2 ** len(point), "multilinear table has the wrong size")
         low = min(self.LOW_VARIABLES, len(point))
-        low_weights = [int(weight) for weight in eq_kernel(point[:low])]  # limbs packed, so adding is one XOR
+        low_weights = [weight.packed for weight in eq_kernel(point[:low])]
         group = 1 << low
         buckets = [0] * 2048  # one per (byte position, byte value): the weights of the words with that byte
         total = ZERO
@@ -430,7 +448,7 @@ class BytecodeTable:
                         touched.add(slot)
                     word >>= 8
                     position += 256
-            bits = [0] * 64  # A_k, limbs packed
+            bits = [0] * 64  # A_k, packed
             for slot in touched:
                 value, buckets[slot] = buckets[slot], 0
                 base, byte = (slot >> 8) * 8, slot & 0xFF
@@ -438,11 +456,10 @@ class BytecodeTable:
                     lowest = byte & -byte
                     bits[base + lowest.bit_length() - 1] ^= value
                     byte ^= lowest
-            limbs = [0, 0, 0]
+            partial = 0  # sum_k x^k A_k, unreduced: each limb shifts within its 128-bit window
             for shift, value in enumerate(bits):
-                for limb in range(3):
-                    limbs[limb] ^= (value >> (64 * limb) & (2**64 - 1)) << shift
-            total = total + high_weight * _e(*(_reduce(limb) for limb in limbs))
+                partial ^= value << shift
+            total = total + high_weight * E._of(_reduce(partial))
         return total
 
 
