@@ -27,9 +27,9 @@ from .verifier import (
     VerificationError,
     build_layout,
     bus_layout,
-    dot,
     eq_kernel,
     fiat_shamir_iv,
+    multilinear_eval,
     require,
     verify_execution,
 )
@@ -134,9 +134,8 @@ def deferred_cells(bytecode: BytecodeTable, point: Sequence[E], matrix_points: t
     for circuit, matrix_point in zip(FLOCK_CIRCUITS, matrix_points, strict=True):
         size = circuit.log_size
         require(len(matrix_point) == 2 * size, "deferred matrix point has the wrong length")
-        row_weights = eq_kernel(matrix_point[:size])
         a_values, b_values = circuit.row_values(eq_kernel(matrix_point[size:]))
-        cells += [*matrix_point, dot(row_weights, a_values), dot(row_weights, b_values)]
+        cells += [*matrix_point, multilinear_eval(a_values, matrix_point[:size]), multilinear_eval(b_values, matrix_point[:size])]
     return cells
 
 

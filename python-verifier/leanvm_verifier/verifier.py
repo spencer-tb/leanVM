@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import sys
 from array import array
 from collections.abc import Callable, Iterable, Sequence
@@ -294,11 +295,11 @@ def eq_kernel(point: Sequence[E]) -> list[E]:
 
 
 def multilinear_eval(mle: Sequence[K | E], point: Sequence[E]) -> E:
+    """`dot(eq_kernel(point), mle)`. The kernel is the tensor product of its high and low variables' kernels, so the sum
+    takes one kernel per half and never forms the full one."""
     require(len(mle) == 2 ** len(point), "multilinear table has the wrong size")
-    cur = [E.lift(value) for value in mle]
-    for r in point:
-        cur = [cur[2 * i] + (cur[2 * i] + cur[2 * i + 1]) * r for i in range(len(cur) // 2)]  # a (1 + r) + b r
-    return cur[0]
+    low = len(point) // 2
+    return tensor_dot(eq_kernel(point[low:]), eq_kernel(point[:low]), mle)
 
 
 def log2_ceil(value: int) -> int:
@@ -322,6 +323,13 @@ def dot(left: Sequence[K | E], right: Sequence[K | E]) -> E:
     for x, y in zip(left, right, strict=True):
         product ^= _clmul(E.lift(x).packed, E.lift(y).packed, 384)
     return E._of(_fold(product))
+
+
+def tensor_dot(outer: Sequence[E], inner: Sequence[E], values: Sequence[K | E]) -> E:
+    """`dot([o * i for o in outer for i in inner], values)`, without forming the tensor product."""
+    width = len(inner)
+    require(len(values) == len(outer) * width, "tensor product and values differ in length")
+    return dot(outer, [dot(inner, values[at : at + width]) for at in range(0, len(values), width)])
 
 
 def index_mle(point: MultilinearPoint) -> E:
@@ -437,17 +445,16 @@ class BytecodeTable:
         buckets = [0] * 2048  # one per (byte position, byte value): the weights of the words with that byte
         total = ZERO
         for high, high_weight in enumerate(eq_kernel(point[low:])):
-            touched = set()
-            for offset, word in enumerate(self.words[high * group : (high + 1) * group]):
+            words = self.words[high * group : (high + 1) * group]
+            touched: set[int] = set()
+            for offset, word in zip(itertools.compress(range(group), words), itertools.compress(words, words)):  # the nonzero words only
                 weight = low_weights[offset]
-                position = 0
-                while word:
-                    if word & 0xFF:
-                        slot = position | (word & 0xFF)
-                        buckets[slot] ^= weight
-                        touched.add(slot)
-                    word >>= 8
-                    position += 256
+                slots = _byte_slots(word)
+                for slot in slots:
+                    buckets[slot] ^= weight
+                touched.update(slots)
+            if not touched:
+                continue
             bits = [0] * 64  # A_k, packed
             for slot in touched:
                 value, buckets[slot] = buckets[slot], 0
@@ -461,6 +468,12 @@ class BytecodeTable:
                 partial ^= value << shift
             total = total + high_weight * E._of(_reduce(partial))
         return total
+
+
+@cache
+def _byte_slots(word: int) -> tuple[int, ...]:
+    """A word's nonzero bytes as bucket slots, (byte position, byte value). A table repeats few distinct words."""
+    return tuple(position << 8 | word >> 8 * position & 0xFF for position in range(8) if word >> 8 * position & 0xFF)
 
 
 # Fiat--Shamir ---------------------------------------------------------------
@@ -1393,10 +1406,11 @@ class FlockCircuit:
     def lincheck_rounds(self) -> int:
         return self.log_size - FLOCK_K_SKIP
 
-    def bilinear(self, alpha: E, row_weights: Sequence[E], column_weights: Sequence[E]) -> E:
-        """Compute `e_row^T (A0 + alpha B0) w_col` from the two forward row vectors."""
+    def bilinear(self, alpha: E, row_weights: tuple[Sequence[E], Sequence[E]], column_weights: Sequence[E]) -> E:
+        """Compute `e_row^T (A0 + alpha B0) w_col` from the two forward row vectors, `e_row` given as the two factors of
+        its tensor product."""
         left_values, right_values = self.row_values(column_weights)
-        return dot(row_weights, left_values) + alpha * dot(row_weights, right_values)
+        return tensor_dot(*row_weights, left_values) + alpha * tensor_dot(*row_weights, right_values)
 
 
 @dataclass(frozen=True)
@@ -1432,7 +1446,7 @@ def verify_flock_lincheck(circuit: FlockCircuit, zc: ZerocheckResult, transcript
     # e_row: phi8 Lagrange in the skip coordinate, eq in the slot variables.
     skip_weights = lagrange_weights(K_BITS, zc.z_skip)
     chi_in = zc.chi[: circuit.lincheck_rounds]
-    e_row = [weight * value for weight in eq_kernel(chi_in) for value in skip_weights]
+    e_row = (eq_kernel(chi_in), skip_weights)  # its tensor product's two factors, which `bilinear` sums against
 
     # The rounds that bind the high column coordinates, leaving 64 unfolded.
     claim = zc.v_a + alpha * zc.v_b + alpha**2 * zc.v_c + alpha**3
