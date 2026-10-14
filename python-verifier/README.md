@@ -21,3 +21,14 @@ The guest's bytecode table and the test vectors come from Rust:
 EXPORT_DIR=out cargo test --release -p rec_aggregation --features eip8288-mixed --lib export_python_vectors -- --ignored
 xz -9e -k out/bytecode.bin   # eip8288_mixed_guest_bytecode.bin.xz, after checking its BLAKE2s
 ```
+
+`export_eip8288_test_proofs` proves block proofs for consumers' test suites: every file in `EXPORT_REQUESTS` lists one
+block's dependencies, a hex line of 96 bytes each, and each block's proof lands in `EXPORT_DIR` as `<deps_hash>.bin`,
+signed by the 16 test keys it also writes (`keys.bin`).
+
+## Speed
+
+The protocol code reads as the document does; the arithmetic under it is where the time goes, so that is what is tuned.
+An extension element is one integer with its limbs 128 bits apart, a product is one integer multiplication of the two
+operands with every bit spread into its own byte (`_clmul`), and sums of products are reduced once. A block proof
+verifies in about 2.5 to 4 seconds on CPython 3.14 (an Apple M-series core), against 20 to 40 before.
