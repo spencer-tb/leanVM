@@ -141,7 +141,7 @@ pub fn padding_instance() -> Instance {
 /// Domain separator for this circuit in the Fiat-Shamir seed (`lean_vm::cpu`):
 /// the hash of [`R1CS_DIGEST_LABEL`], which names the relation and its layout.
 /// A deliberate circuit change bumps the label, and the digest is mirrored in
-/// `python-verifier/verifier.py` and in the recursion guest.
+/// `python-verifier/leanvm_verifier/verifier.py` and in the recursion guest.
 pub const R1CS_DIGEST: [u8; 32] = [
     0x3e, 0x1e, 0x2d, 0xd8, 0x64, 0xd8, 0xaa, 0xf3, 0x5a, 0xd3, 0x6e, 0x47, 0xd7, 0x64, 0x15, 0x22, 0xea, 0x04, 0x2e,
     0x54, 0x2c, 0x87, 0x0b, 0x9e, 0x94, 0xf4, 0xb0, 0x7d, 0x35, 0xb6, 0xee, 0x60,

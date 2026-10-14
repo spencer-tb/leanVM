@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import sys
+from array import array
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import cache, reduce
@@ -8,6 +10,7 @@ from itertools import accumulate, islice, repeat
 from operator import mul
 from pathlib import Path
 from struct import pack, unpack
+from typing import TypeAlias
 
 
 class VerificationError(Exception):
@@ -227,7 +230,7 @@ class Digest:
 # Multilinear and stacking helpers --------------------------------------------
 
 
-type MultilinearPoint = tuple[E, ...]
+MultilinearPoint: TypeAlias = "tuple[E, ...]"
 
 
 def eq_kernel(point: Sequence[E]) -> list[E]:
@@ -319,15 +322,101 @@ def _selector_point(selector: int, length: int) -> MultilinearPoint:
 
 
 @dataclass(frozen=True)
+class MerklePhase:
+    """One Merkle opening as transmitted (`fiat_shamir::merkle::PrunedMerklePaths`): a row per distinct queried position,
+    ascending, and one "octopus" of sibling digests authenticating them all, each shared node sent once."""
+
+    rows: tuple[tuple[int, ...], ...]
+    siblings: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
 class Proof:
+    """The scalar stream, then the Merkle openings in either form: as `RawProof` lays them out, every opening's leaf
+    words then its sibling digests, back to back, or as transmitted, one pruned phase per opening."""
+
     stream: tuple[E, ...]
-    merkle_openings: bytes
+    merkle_openings: bytes | tuple[MerklePhase, ...]
 
     @classmethod
     def load(cls, stream: Path, merkle_openings: Path) -> Proof:
         data = stream.read_bytes()
         require(len(data) % 24 == 0, "the stream is not a whole number of field elements")
         return cls(tuple(E.from_bytes(data[at : at + 24]) for at in range(0, len(data), 24)), merkle_openings.read_bytes())
+
+
+# The bytecode table ----------------------------------------------------------------
+
+
+def _reduce_product(product: int) -> int:
+    """A carry-less product of two K words, reduced modulo x^64 + x^4 + x^3 + x + 1."""
+    low, high = product & (2**64 - 1), product >> 64
+    folded = low ^ high ^ (high << 1) ^ (high << 3) ^ (high << 4)
+    overflow = folded >> 64
+    return ((folded & (2**64 - 1)) ^ overflow ^ (overflow << 1) ^ (overflow << 3) ^ (overflow << 4)) & (2**64 - 1)
+
+
+class BytecodeTable:
+    """A program's stacked bytecode multilinear: little-endian 64-bit words, kept packed.
+
+    A recursive guest's table holds millions of words, so `evaluate` avoids a field multiplication per word. Every word is
+    a polynomial over GF(2) and multiplication is GF(2)-linear in it: `sum_l t_l w_l = sum_k x^k A_k`, where `A_k` sums
+    the weights `w_l` of the words with bit k set. Splitting the point's variables into low and high halves, only the low
+    half's weights enter those sums (by XOR alone), and the high half's weights scale one partial sum per group."""
+
+    LOW_VARIABLES = 12
+
+    def __init__(self, data: bytes) -> None:
+        require(len(data) % 8 == 0, "bytecode is not a whole number of 64-bit words")
+        self.words = array("Q")
+        self.words.frombytes(data)
+        if sys.byteorder == "big":
+            self.words.byteswap()
+
+    def __len__(self) -> int:
+        return len(self.words)
+
+    def to_bytes(self) -> bytes:
+        if sys.byteorder == "big":
+            swapped = array("Q", self.words)
+            swapped.byteswap()
+            return swapped.tobytes()
+        return self.words.tobytes()
+
+    def evaluate(self, point: Sequence[E]) -> E:
+        """The multilinear extension at `point`, its variables least significant first."""
+        require(len(self.words) == 2 ** len(point), "multilinear table has the wrong size")
+        low = min(self.LOW_VARIABLES, len(point))
+        low_weights = [int(weight) for weight in eq_kernel(point[:low])]  # limbs packed, so adding is one XOR
+        group = 1 << low
+        buckets = [0] * 2048  # one per (byte position, byte value): the weights of the words with that byte
+        total = ZERO
+        for high, high_weight in enumerate(eq_kernel(point[low:])):
+            touched = set()
+            for offset, word in enumerate(self.words[high * group : (high + 1) * group]):
+                weight = low_weights[offset]
+                position = 0
+                while word:
+                    if word & 0xFF:
+                        slot = position | (word & 0xFF)
+                        buckets[slot] ^= weight
+                        touched.add(slot)
+                    word >>= 8
+                    position += 256
+            bits = [0] * 64  # A_k, limbs packed
+            for slot in touched:
+                value, buckets[slot] = buckets[slot], 0
+                base, byte = (slot >> 8) * 8, slot & 0xFF
+                while byte:
+                    lowest = byte & -byte
+                    bits[base + lowest.bit_length() - 1] ^= value
+                    byte ^= lowest
+            limbs = [0, 0, 0]
+            for shift, value in enumerate(bits):
+                for limb in range(3):
+                    limbs[limb] ^= (value >> (64 * limb) & (2**64 - 1)) << shift
+            total = total + high_weight * E(*(_reduce_product(limb) for limb in limbs))
+        return total
 
 
 # Fiat--Shamir ---------------------------------------------------------------
@@ -348,7 +437,7 @@ class Transcript:
         self.proof = proof
         self.state = compress(fiat_shamir_IV.words(), public_input.words())
         self.stream_offset = 0  # in E field elements
-        self.opening_offset = 0  # in bytes
+        self.opening_offset = 0  # in bytes, or in phases for a transmitted proof
 
     def observe(self, value: E) -> None:
         self.state = compress(self.state, (value.c0, value.c1, value.c2, DS_OBSERVE))
@@ -389,7 +478,14 @@ class Transcript:
         self.opening_offset = end
         return chunk
 
-    def merkle(self, root: Digest, block_length: int, queries: Sequence[int], leaf_words: int) -> list[tuple[K, ...]]:
+    def merkle(self, root: Digest, block_length: int, queries: Sequence[int], leaf_words: int, sent_words: int) -> list[tuple[K, ...]]:
+        """Authenticate the next opening against `root` and return each query's leaf, in `queries` order. A transmitted
+        row carries only the leaf's last `sent_words` words, the others being zero (the stack's uncommitted lanes)."""
+        if isinstance(self.proof.merkle_openings, bytes):
+            return self._raw_merkle(root, block_length, queries, leaf_words)
+        return self._pruned_merkle(root, block_length, queries, leaf_words, sent_words)
+
+    def _raw_merkle(self, root: Digest, block_length: int, queries: Sequence[int], leaf_words: int) -> list[tuple[K, ...]]:
         height = log2_strict(block_length)
         rows = []
         for query in queries:
@@ -402,6 +498,44 @@ class Transcript:
             require(node == root, "Merkle root mismatch")
             rows.append(tuple(K(word) for word in unpack(f"<{leaf_words}Q", leaf)))
         return rows
+
+    def _pruned_merkle(self, root: Digest, block_length: int, queries: Sequence[int], leaf_words: int, sent_words: int) -> list[tuple[K, ...]]:
+        """`PrunedMerklePaths::open`: hash every distinct leaf, then climb level by level, taking a sibling from the
+        octopus only where the sibling is not itself a known node."""
+        openings = self.proof.merkle_openings
+        require(self.opening_offset < len(openings), "Merkle opening missing")
+        phase = openings[self.opening_offset]
+        self.opening_offset += 1
+        height = log2_strict(block_length)
+        positions = sorted(set(queries))
+        require(len(queries) > 0 and sent_words <= leaf_words and len(positions) == len(phase.rows), "Merkle phase has the wrong rows")
+        require(positions[-1] < block_length, "Merkle query out of range")
+        leaves = {}
+        nodes = []
+        for position, row in zip(positions, phase.rows, strict=True):
+            require(len(row) == sent_words, "Merkle row has the wrong width")
+            leaf = (0,) * (leaf_words - sent_words) + tuple(row)
+            leaves[position] = leaf
+            nodes.append((position, blake2s_hash(pack(f"<{leaf_words}Q", *leaf)).value))
+        siblings = iter(phase.siblings)
+        for _ in range(height):
+            parents = []
+            i = 0
+            while i < len(nodes):
+                index, node = nodes[i]
+                if index & 1 == 0 and i + 1 < len(nodes) and nodes[i + 1][0] == index | 1:
+                    left, right = node, nodes[i + 1][1]
+                    i += 2
+                else:
+                    sibling = next(siblings, None)
+                    require(sibling is not None, "Merkle octopus too short")
+                    left, right = (node, sibling) if index & 1 == 0 else (sibling, node)
+                    i += 1
+                parents.append((index >> 1, blake2s_hash(left + right).value))
+            nodes = parents
+        require(next(siblings, None) is None, "Merkle octopus too long")
+        require(nodes[0][1] == root.value, "Merkle root mismatch")
+        return [tuple(K(word) for word in leaves[query]) for query in queries]
 
     def sumcheck_round_poly(self, count: int, claim: E, eq_factor: E | None = None) -> list[E]:
         """returns q(X) := c0 + c1X + c2X^2 + ..."""
@@ -557,7 +691,7 @@ def verify_bus_balance(layout: Layout, transcript: Transcript) -> BusResult:
     claims.append(ColumnClaim(BYTECODE_FINAL_COUNTERS, bytecode_low, bytecode_final))
     memory_index = index_mle(memory_low)
     bytecode_index = index_mle(bytecode_low)
-    bytecode_value = multilinear_eval(layout.bytecode, (*bytecode_low, *alphas))
+    bytecode_value = layout.bytecode.evaluate((*bytecode_low, *alphas))
 
     def fingerprints(pc: E, memory_count: E, bytecode_count: E) -> tuple[E, E, E]:
         """The three framework tuples, each its coordinates weighted by eq(alpha, .); slots past the ones
@@ -657,13 +791,14 @@ KECCAK_PRODUCT_WORD = 51
 class Layout:
     log_memory: int
     log_bytecode: int
-    bytecode: Sequence[K]
+    bytecode: BytecodeTable
     push: tuple[BusBlock, ...]
     pull: tuple[BusBlock, ...]
     count: tuple[BusBlock, ...]
     placements: tuple[Placement, ...]
     stack_log: int
     table_log_heights: tuple[int, ...]
+    n_lanes: int  # the stack's committed lanes, the words a transmitted level-0 leaf carries
 
 
 def _cols(columns: Sequence[str], *names: str) -> tuple[int, ...]:
@@ -913,7 +1048,7 @@ TABLE_WIDTHS = tuple(t.width for t in TABLES)
 GLOBAL_COLUMN_BASES = tuple(NUM_GLOBAL_COLUMNS + sum(TABLE_WIDTHS[:table]) for table in range(len(TABLES)))
 
 
-def build_layout(bytecode: Sequence[K], log_memory: int, table_log_heights: Sequence[int]) -> Layout:
+def build_layout(bytecode: BytecodeTable, log_memory: int, table_log_heights: Sequence[int]) -> Layout:
     log_bytecode = log2_strict(len(bytecode)) - BUS_BITS
     require(
         16 <= log_memory <= 32
@@ -953,6 +1088,9 @@ def build_layout(bytecode: Sequence[K], log_memory: int, table_log_heights: Sequ
     block_offsets, total_log = stack_offsets(list(blocks.values()))
     offsets = dict(zip(blocks, block_offsets))
     stack_log = max(MIN_STACKED_LOG, total_log)  # Floor at the PCS minimum
+    # Lanes holding no placed block are never committed (`witness::placements_of`).
+    placed = sum(2**kappa for kappa in blocks.values())
+    n_lanes = max(1, -(-placed // 2 ** (stack_log - INITIAL_FOLDING_FACTOR)))
     placements = []
     for column, kappa in enumerate(kappas):
         if column in limbs:
@@ -960,7 +1098,7 @@ def build_layout(bytecode: Sequence[K], log_memory: int, table_log_heights: Sequ
             placements.append(Placement(kappa, offsets[circuit.qflock] + slot, circuit.slot_bits))
         else:
             placements.append(Placement(kappa, offsets[column]))
-    return Layout(log_memory, log_bytecode, bytecode, tuple(push), tuple(pull), tuple(count), tuple(placements), stack_log, tuple(table_log_heights))
+    return Layout(log_memory, log_bytecode, bytecode, tuple(push), tuple(pull), tuple(count), tuple(placements), stack_log, tuple(table_log_heights), n_lanes)
 
 
 # WHIR opening ----------------------------------------------------------------
@@ -1071,7 +1209,7 @@ class GluedClaim:
     weight_at: Callable[[Sequence[E]], E]
 
 
-def verify_whir(transcript: Transcript, log_n: int, log_inv_rate: int, target: E, root: Digest, evaluate_basis: Callable[[Sequence[E]], E]) -> None:
+def verify_whir(transcript: Transcript, log_n: int, n_lanes: int, log_inv_rate: int, target: E, root: Digest, evaluate_basis: Callable[[Sequence[E]], E]) -> None:
     """Verify the base-field multilevel opening with a one-point terminal check."""
     config = derive_config(log_n, log_inv_rate)
     levels = len(config.folds)
@@ -1112,7 +1250,8 @@ def verify_whir(transcript: Transcript, log_n: int, log_inv_rate: int, target: E
         # Level 0 committed the K witness, one leaf word per lane; every deeper
         # level a folded E one, three words per lane.
         lanes = 2**fold_count
-        words = transcript.merkle(current_root, block_length, queries, lanes if level == 0 else 3 * lanes)
+        leaf_words = lanes if level == 0 else 3 * lanes
+        words = transcript.merkle(current_root, block_length, queries, leaf_words, n_lanes if level == 0 else leaf_words)
         rows: list[Sequence[K | E]] = [tuple(reversed(row)) for row in words] if level == 0 else [_ext_row(row) for row in words]
         enforced = _enforced_sum(rows, level_folds, query_weights)
 
@@ -1498,23 +1637,28 @@ def ring_switch(families: Sequence[tuple[MultilinearPoint, Sequence[E]]], transc
 # Stacked opening -------------------------------------------------------------
 
 
-type StackClaim = tuple[Callable[[Sequence[E]], E], E]  # the weight it puts on the stack, and the value it claims for it
+StackClaim: TypeAlias = "tuple[Callable[[Sequence[E]], E], E]"  # the weight it puts on the stack, and the value it claims for it
 
 
-def verify_stacked_opening(transcript: Transcript, root: Digest, stack_log: int, log_inv_rate: int, claims: Sequence[StackClaim]) -> None:
+def verify_stacked_opening(transcript: Transcript, root: Digest, stack_log: int, n_lanes: int, log_inv_rate: int, claims: Sequence[StackClaim]) -> None:
     """Discharge every claim on the committed stack in one opening: the same powers of one challenge
     batch the values into the target, and the weights into the basis WHIR evaluates at its terminal point.
     """
     weights, values = zip(*claims, strict=True)
     scales = powers(transcript.sample(), len(claims))
-    verify_whir(transcript, stack_log, log_inv_rate, dot(scales, values), root, lambda point: dot(scales, [weight(point) for weight in weights]))
+    verify_whir(transcript, stack_log, n_lanes, log_inv_rate, dot(scales, values), root, lambda point: dot(scales, [weight(point) for weight in weights]))
 
 
-def verify_execution(bytecode: Sequence[K], public_input: Digest, proof: Proof) -> None:
-    bytecode_hash = blake2s_hash(b"".join(word.to_bytes() for word in bytecode))
+def fiat_shamir_iv(bytecode: BytecodeTable) -> Digest:
+    """The transcript's starting chaining value, binding the circuit version and the program (`cpu::fs_seed`): the
+    program's verification key."""
+    bytecode_hash = blake2s_hash(bytecode.to_bytes())
     r1cs_digests = b"".join(pack("<Q", len(circuit.r1cs_digest)) + circuit.r1cs_digest for circuit in FLOCK_CIRCUITS)
-    iv_preimage = b"leanvm" + r1cs_digests + bytecode_hash.value
-    fiat_shamir_IV = blake2s_hash(iv_preimage)
+    return blake2s_hash(b"leanvm" + r1cs_digests + bytecode_hash.value)
+
+
+def verify_execution(bytecode: BytecodeTable, public_input: Digest, proof: Proof) -> None:
+    fiat_shamir_IV = fiat_shamir_iv(bytecode)
     transcript = Transcript(proof, fiat_shamir_IV, public_input)
 
     # 1] memory log-size, table log-size, and log-inv-rate in WHIR
@@ -1560,7 +1704,7 @@ def verify_execution(bytecode: Sequence[K], public_input: Digest, proof: Proof) 
         # placement's selector, and the two lead the batch in circuit order, taking the first powers.
         qflock = layout.placements[circuit.qflock]
         ringswitches.append((lambda x, qflock=qflock, weight=weight: qflock.eq_above(x) * weight(x[: qflock.variables]), target))
-    verify_stacked_opening(transcript, root, layout.stack_log, log_inverse_rate, [*ringswitches, *(c.on_stack(layout) for c in claims)])
+    verify_stacked_opening(transcript, root, layout.stack_log, layout.n_lanes, log_inverse_rate, [*ringswitches, *(c.on_stack(layout) for c in claims)])
     transcript.finish()
 
 
@@ -1574,9 +1718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("merkle_openings", type=Path, help="every Merkle opening: its leaf's words, then its sibling digests")
     arguments = parser.parse_args(argv)
     try:
-        encoded_bytecode = arguments.bytecode.read_bytes()
-        require(len(encoded_bytecode) % 8 == 0, "bytecode is not a whole number of 64-bit words")
-        bytecode = [K(int.from_bytes(encoded_bytecode[i : i + 8], "little")) for i in range(0, len(encoded_bytecode), 8)]
+        bytecode = BytecodeTable(arguments.bytecode.read_bytes())
         proof = Proof.load(arguments.stream, arguments.merkle_openings)
         verify_execution(bytecode, Digest(arguments.public_input.read_bytes()), proof)
     except (OSError, ValueError, KeyError, VerificationError) as exc:

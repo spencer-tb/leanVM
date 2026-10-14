@@ -20,7 +20,7 @@ for rate in range(1, 5):
 
 #[test]
 fn whir_query_table_matches_rust() {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier");
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier/leanvm_verifier");
     let output = Command::new("python3")
         .arg("-c")
         .arg(DUMP)
@@ -45,7 +45,7 @@ fn whir_query_table_matches_rust() {
     assert_eq!(
         (min_log, max_log),
         (lean_vm::pcs::MIN_MU, lean_vm::pcs::MAX_MU),
-        "set MIN_STACKED_LOG / MAX_STACKED_LOG in python-verifier/verifier.py to {} / {}",
+        "set MIN_STACKED_LOG / MAX_STACKED_LOG in python-verifier/leanvm_verifier/verifier.py to {} / {}",
         lean_vm::pcs::MIN_MU,
         lean_vm::pcs::MAX_MU
     );
@@ -85,7 +85,7 @@ fn whir_query_table_matches_rust() {
 }
 
 /// Regenerates the literal the pin above checks: paste its output over `WHIR_QUERIES` in
-/// `python-verifier/verifier.py`.
+/// `python-verifier/leanvm_verifier/verifier.py`.
 /// `cargo test --release -p lean_vm --test verifiers print_whir_query_table -- --ignored --nocapture`
 #[test]
 #[ignore = "manual table regeneration"]

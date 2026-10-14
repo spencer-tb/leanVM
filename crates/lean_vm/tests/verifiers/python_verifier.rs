@@ -1,4 +1,4 @@
-//! Pins `python-verifier/verifier.py` against `lean_vm::cpu::verify`: the same
+//! Pins `python-verifier/leanvm_verifier/verifier.py` against `lean_vm::cpu::verify`: the same
 //! protocol is written out in Rust, in Python, and in zkDSL, so any protocol
 //! change must land in all three, and this is what catches the Python one
 //! drifting.
@@ -67,7 +67,7 @@ fn python_verify(directory: &Path, bytecode: &Path, public_input: &Path, raw: &R
     std::fs::write(&stream_path, stream).expect("write scalar stream");
     std::fs::write(&openings_path, openings).expect("write Merkle openings");
     Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier/verifier.py"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier/leanvm_verifier/verifier.py"))
         .arg(bytecode)
         .arg(public_input)
         .arg(stream_path)

@@ -270,7 +270,7 @@ pub fn padding_block() -> Compression {
 /// cost bought only this constant. To recompute it, check out the last
 /// commit that still had `build_matrices` and run `r1cs_digest_matches_baked`.
 ///
-/// The value is mirrored in `python-verifier/verifier.py`, which never could
+/// The value is mirrored in `python-verifier/leanvm_verifier/verifier.py`, which never could
 /// rebuild the matrices, and in the recursion guest, so a deliberate circuit
 /// change means bumping all three by hand.
 pub const R1CS_DIGEST: [u8; 32] = [
