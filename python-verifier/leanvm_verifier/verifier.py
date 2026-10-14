@@ -33,12 +33,25 @@ _SPREAD = bytes.maketrans(b"01", b"\x00\x01")
 _PARITY_DIGIT = bytes(0x30 | (count & 1) for count in range(256))
 
 
+def _spread(value: int, bits: int = 384) -> int:
+    """`value`'s low `bits` bits, one per byte."""
+    return int.from_bytes(format(value, f"0{bits}b").encode().translate(_SPREAD), "big")
+
+
+def _gather(spread_product: int, bits: int = 384) -> int:
+    """The carry-less product an integer product of two `bits`-bit spreads stands for: each byte's parity."""
+    return int(spread_product.to_bytes(2 * bits, "big").translate(_PARITY_DIGIT), 2)
+
+
 def _clmul(left: int, right: int, bits: int) -> int:
     """The carry-less product of two `bits`-bit operands whose counts stay below 256: K words (at most 64 terms), or
     packed E elements (at most 3 * 64)."""
-    spread_left = int.from_bytes(format(left, f"0{bits}b").encode().translate(_SPREAD), "big")
-    spread_right = int.from_bytes(format(right, f"0{bits}b").encode().translate(_SPREAD), "big")
-    return int((spread_left * spread_right).to_bytes(2 * bits, "big").translate(_PARITY_DIGIT), 2)
+    return _gather(_spread(left, bits) * _spread(right, bits), bits)
+
+
+# A sum of spread products stays a spread while each product keeps only its parities, so a sum of many products is
+# gathered once.
+_PARITIES = int.from_bytes(b"\x01" * 768, "big")
 
 
 _WORD = 2**64 - 1
@@ -289,7 +302,7 @@ MultilinearPoint: TypeAlias = "tuple[E, ...]"
 def eq_kernel(point: Sequence[E]) -> list[E]:
     out = [ONE]
     for r in point:
-        high = [v * r for v in out]
+        high = outer_product(out, [r])
         out = [v + h for v, h in zip(out, high)] + high  # v (1 + r) = v + v r
     return out
 
@@ -318,18 +331,34 @@ def eq_eval(left: Sequence[E], right: Sequence[E]) -> E:
     return result
 
 
+def _spreads(values: Sequence[K | E]) -> list[int]:
+    return [_spread(E.lift(value).packed) for value in values]
+
+
+def _spread_dot(left: Sequence[int], right: Sequence[K | E]) -> E:
+    """`dot` with the left factors already spread. The sum is gathered, folded and reduced once: all three are linear."""
+    total = 0
+    for spread, y in zip(left, right, strict=True):
+        total ^= spread * _spread(E.lift(y).packed) & _PARITIES
+    return E._of(_fold(_gather(total)))
+
+
 def dot(left: Sequence[K | E], right: Sequence[K | E]) -> E:
-    product = 0  # the products' unreduced sum, reduced once: reduction is linear
-    for x, y in zip(left, right, strict=True):
-        product ^= _clmul(E.lift(x).packed, E.lift(y).packed, 384)
-    return E._of(_fold(product))
+    return _spread_dot(_spreads(left), right)
 
 
 def tensor_dot(outer: Sequence[E], inner: Sequence[E], values: Sequence[K | E]) -> E:
     """`dot([o * i for o in outer for i in inner], values)`, without forming the tensor product."""
     width = len(inner)
     require(len(values) == len(outer) * width, "tensor product and values differ in length")
-    return dot(outer, [dot(inner, values[at : at + width]) for at in range(0, len(values), width)])
+    inner_spreads = _spreads(inner)
+    return dot(outer, [_spread_dot(inner_spreads, values[at : at + width]) for at in range(0, len(values), width)])
+
+
+def outer_product(outer: Sequence[E], inner: Sequence[E]) -> list[E]:
+    """`[o * i for o in outer for i in inner]`, every factor spread once."""
+    inner_spreads = _spreads(inner)
+    return [E._of(_fold(_gather(left * right))) for left in _spreads(outer) for right in inner_spreads]
 
 
 def index_mle(point: MultilinearPoint) -> E:
@@ -446,15 +475,17 @@ class BytecodeTable:
         total = ZERO
         for high, high_weight in enumerate(eq_kernel(point[low:])):
             words = self.words[high * group : (high + 1) * group]
+            sums: dict[int, int] = {}  # per distinct nonzero word, the weights of its offsets: a table repeats few words
+            for offset, word in zip(itertools.compress(range(group), words), itertools.compress(words, words)):
+                sums[word] = sums.get(word, 0) ^ low_weights[offset]
+            if not sums:
+                continue
             touched: set[int] = set()
-            for offset, word in zip(itertools.compress(range(group), words), itertools.compress(words, words)):  # the nonzero words only
-                weight = low_weights[offset]
+            for word, weight in sums.items():
                 slots = _byte_slots(word)
                 for slot in slots:
                     buckets[slot] ^= weight
                 touched.update(slots)
-            if not touched:
-                continue
             bits = [0] * 64  # A_k, packed
             for slot in touched:
                 value, buckets[slot] = buckets[slot], 0
@@ -472,7 +503,7 @@ class BytecodeTable:
 
 @cache
 def _byte_slots(word: int) -> tuple[int, ...]:
-    """A word's nonzero bytes as bucket slots, (byte position, byte value). A table repeats few distinct words."""
+    """A word's nonzero bytes as bucket slots, (byte position, byte value)."""
     return tuple(position << 8 | word >> 8 * position & 0xFF for position in range(8) if word >> 8 * position & 0xFF)
 
 
@@ -1457,7 +1488,7 @@ def verify_flock_lincheck(circuit: FlockCircuit, zc: ZerocheckResult, transcript
     # collapses to eq(chi_in, chi_in_prime) times a 64-term Lagrange combination.
     s = tuple(transcript.next_scalars(K_BITS))
     chi_in_prime = tuple(reversed(round_challenges))
-    w_col = [value * weight for weight in eq_kernel(chi_in_prime) for value in s]
+    w_col = outer_product(eq_kernel(chi_in_prime), s)
     terminal = (
         circuit.bilinear(alpha, e_row, w_col)
         + alpha**2 * eq_eval(chi_in, chi_in_prime) * dot(skip_weights, s)
