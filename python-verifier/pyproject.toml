@@ -1,0 +1,31 @@
+[project]
+name = "leanvm-verifier"
+version = "0.1.0"
+description = "Dependency-free Python verifier for leanVM execution proofs and EIP-8288 block proofs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+leanvm-verify = "leanvm_verifier.verifier:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["leanvm_verifier"]
+
+[tool.hatch.build.targets.sdist]
+include = ["leanvm_verifier", "tests", "README.md"]
+
+[dependency-groups]
+test = ["pytest>=8"]
+
+[tool.ruff]
+line-length = 150
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

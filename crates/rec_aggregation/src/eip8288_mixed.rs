@@ -95,6 +95,175 @@ pub fn sphincs_verification_key(pk: &SphincsPublicKey) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    const TEST_KEYS: usize = 16;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Write the test leanSPHINCS keys (`keys.bin`, 32 bytes each) and a
+    /// genuine root proof for every requested dependency set, one hex line of
+    /// 96-byte dependencies each, as `<deps_hash>.bin`: `EXPORT_DIR=...
+    /// [EXPORT_REQUESTS=...] cargo test --release --features eip8288-mixed
+    /// export_eip8288_test_proofs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn export_eip8288_test_proofs() {
+        let directory = std::env::var("EXPORT_DIR").expect("EXPORT_DIR");
+        let keys: Vec<_> = (0..TEST_KEYS)
+            .map(|i| sphincs::key_gen_from_seed([i as u8 + 1; 32]))
+            .collect();
+        let verification_keys: Vec<[u8; 32]> =
+            keys.iter().map(|(_, pk)| sphincs_verification_key(pk)).collect();
+        std::fs::write(format!("{directory}/keys.bin"), verification_keys.concat()).unwrap();
+        let Ok(requests) = std::env::var("EXPORT_REQUESTS") else {
+            return;
+        };
+        let mut lines = Vec::new();
+        for entry in std::fs::read_dir(requests).unwrap() {
+            lines.extend(std::fs::read_to_string(entry.unwrap().path()).unwrap().lines().map(str::to_owned));
+        }
+        for line in &lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let bytes = unhex(line);
+            let mut deps: Vec<Dependency> =
+                bytes.chunks(96).map(|chunk| chunk.try_into().unwrap()).collect();
+            deps.sort();
+            deps.dedup();
+            let hash = deps_hash(&deps);
+            let path = format!("{directory}/{}.bin", hex(&hash));
+            if std::path::Path::new(&path).exists() {
+                continue;
+            }
+            let raws: Vec<_> = deps
+                .iter()
+                .map(|dependency| {
+                    assert_eq!(dependency[31], 0x10, "only leanSPHINCS claims");
+                    let index = verification_keys
+                        .iter()
+                        .position(|key| key[..] == dependency[64..96])
+                        .expect("claim under a test key");
+                    let message: [u8; 32] = dependency[32..64].try_into().unwrap();
+                    let (secret, key) = &keys[index];
+                    (*key, message, sphincs::sign(secret, &message))
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let mut level: Vec<MixedProof> = raws
+                .chunks(4)
+                .map(|chunk| {
+                    let selected: Vec<Dependency> =
+                        chunk.iter().map(|(key, message, _)| sph_dep(key, *message)).collect();
+                    aggregate_mixed(&[], chunk, &[], &selected, 1).unwrap()
+                })
+                .collect();
+            while level.len() > 1 {
+                level = level
+                    .chunks(2)
+                    .map(|pair| {
+                        if pair.len() == 1 {
+                            return pair[0].clone();
+                        }
+                        let mut union = pair[0].dependencies().to_vec();
+                        union.extend_from_slice(pair[1].dependencies());
+                        union.sort();
+                        union.dedup();
+                        aggregate_mixed(pair, &[], &[], &union, 1).unwrap()
+                    })
+                    .collect();
+            }
+            let root = level.pop().unwrap();
+            assert_eq!(root.dependencies(), &deps[..]);
+            let payload = root.to_bytes_without_deps();
+            verify_mixed_deps(&hash, &payload).unwrap();
+            std::fs::write(&path, &payload).unwrap();
+            eprintln!("{} deps -> {} bytes in {:.2?}", deps.len(), payload.len(), started.elapsed());
+        }
+    }
+
+    /// Export a genuine one-claim root and every intermediate the Python
+    /// verifier port checks against: `EXPORT_DIR=... cargo test --release
+    /// --features eip8288-mixed export_python_vectors -- --ignored`.
+    #[test]
+    #[ignore]
+    fn export_python_vectors() {
+        let directory = std::env::var("EXPORT_DIR").expect("EXPORT_DIR");
+        let write = |name: &str, bytes: &[u8]| std::fs::write(format!("{directory}/{name}"), bytes).unwrap();
+        let (secret, key) = sphincs::key_gen_from_seed([19; 32]);
+        let message = [23; 32];
+        let signature = sphincs::sign(&secret, &message);
+        let sph = sph_dep(&key, message);
+        let started = std::time::Instant::now();
+        let leaf = aggregate_mixed(&[], &[(key, message, signature.clone())], &[], &[sph], 1).unwrap();
+        eprintln!("proved in {:.2?}", started.elapsed());
+        let payload = leaf.to_bytes_without_deps();
+        let hash = deps_hash(&[sph]);
+        verify_mixed_deps(&hash, &payload).unwrap();
+        let (deferred, proof) = decode_payload(&payload).unwrap();
+        let pi = mixed_statement(hash, &deferred);
+        assert!(pi.iter().all(|value| value.c2 == 0));
+        let raw = verify(unified_guest(), &pi, &proof).unwrap().raw;
+        write("dependency.bin", &sph);
+        write("deps_hash.bin", &hash);
+        write("payload.bin", &payload);
+        write("guest_key.bin", &mixed_guest_key());
+        write("message.bin", &message);
+        write("sphincs_public_key.bin", &key.flatten());
+        write("sphincs_signature.bin", &signature.to_bytes());
+        let table: Vec<u8> = mixed_table().iter().flat_map(|w| w.0.to_le_bytes()).collect();
+        write("bytecode.bin", &table);
+        let pi_bytes: Vec<u8> = pi.iter().flat_map(|v| [v.c0.to_le_bytes(), v.c1.to_le_bytes()].concat()).collect();
+        write("public_input.bin", &pi_bytes);
+        let cells: Vec<u8> = deferred
+            .cells()
+            .iter()
+            .flat_map(|v| [v.c0.to_le_bytes(), v.c1.to_le_bytes(), v.c2.to_le_bytes()].concat())
+            .collect();
+        write("cells.bin", &cells);
+        let mut stream = Vec::new();
+        for scalar in &raw.stream {
+            for limb in [scalar.c0, scalar.c1, scalar.c2] {
+                stream.extend(limb.to_le_bytes());
+            }
+        }
+        let mut openings = Vec::new();
+        for opening in &raw.merkle {
+            for word in &opening.leaf_data {
+                openings.extend(word.0.to_le_bytes());
+            }
+            for digest in &opening.path {
+                openings.extend(digest);
+            }
+        }
+        write("stream.bin", &stream);
+        write("merkle_openings.bin", &openings);
+        let seed = lean_vm::cpu::fs_seed(unified_guest());
+        let seed_bytes: Vec<u8> = seed
+            .iter()
+            .flat_map(|v| [v.c0.to_le_bytes(), v.c1.to_le_bytes(), v.c2.to_le_bytes()].concat())
+            .collect();
+        write("fs_seed.bin", &seed_bytes);
+        eprintln!(
+            "program={} payload={} table_words={} stream={} openings={} key={:02x?}",
+            unified_guest().prog.len(),
+            payload.len(),
+            mixed_table().len(),
+            raw.stream.len(),
+            raw.merkle.len(),
+            mixed_guest_key()
+        );
+    }
+
     #[test]
     #[ignore]
     fn mixed_leaf_and_same_key_depth_two_bind_programs_and_discards() {
